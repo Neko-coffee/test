@@ -1,0 +1,164 @@
+[MODE: RESEARCH]
+一、整体流程：从数据到检测结果（给“总流程图”用）
+可以按时间顺序理解整套模型的主干流程，画图时可分成几大模块串起来：
+1）数据输入与预处理
+模型使用 nuScenes 数据集，单帧输入包括两类原始数据：
+LiDAR 点云：原始 3D 点 (x, y, z, intensity, time)。
+多视角相机图像：6 个相机的彩色图像。
+配置里的数据 pipeline 会完成：加载点云、多帧融合、加载多视角图像、几何增强（旋转、缩放、平移）、图像增强（裁剪、翻转、归一化）、坐标转换矩阵计算（lidar2img 等）。
+2）双模态特征提取（LiDAR 分支 + Camera 分支）
+LiDAR 分支
+（1）体素化：把稀疏点云体素化到规则网格（PointPillars/SECOND 结构），得到 BEV 平面上的体素特征。
+（2）中间编码器：把稀疏体素特征映射到稠密 BEV 特征图，分辨率大约是 180×180（具体看配置）。
+（3）3D backbone + neck：多层卷积 + FPN，将体素特征提炼成统一通道数的 BEV 特征 x_bev，形状约为 [B, C, H_bev, W_bev]。
+Camera 分支
+（1）图像 backbone（VoVNet 等）：对 6 张多视角图像分别提取特征，多尺度输出。
+（2）图像 neck（CPFPN）：对多尺度特征做融合，得到透视特征图 x_img，形状约为 [B×6, C, H_pers, W_pers]，对应每个视角的 2D 视角特征。
+3）查询初始化（object queries）
+检测头 CmtHead 会初始化一组 3D 查询：
+（1）每个查询对应未来要预测的一个 3D 目标（中心点 + 尺寸 + 朝向 + 类别），数量一般是 900。
+（2）为每个查询分配一个初始 3D 参考点（在 BEV 中的位置），并通过位置编码映射到 embedding 空间，形成查询向量 query_embed。
+4）AQR 模块：为每个查询生成模态权重和空间偏置（这是我们的第一大创新点）
+（1）AQR 根据当前查询特征、LiDAR/Camera 特征以及查询在 BEV/图像上的位置，输出每个查询的 LiDAR 权重和 Camera 权重。
+（2）注意：AQR 并不直接改动查询本身，而是给出“这个查询更相信 LiDAR 还是 Camera、在什么局部区域更重要”的信息。
+（3）这些权重会被送入 attention_bias_generator，生成真正作用于 Transformer 的 attention_bias（见第二部分）。
+5）多模态 Transformer 融合（CMT Transformer）
+准备输入
+（1）query：来自检测头的查询向量（带 3D 位置信息）。
+（2）memory：由 LiDAR BEV 特征和 Camera 透视特征拼接而成的“键/值”特征矩阵。
+（3）位置编码：BEV 的 2D 网格位置编码 + 透视特征的相机几何编码。
+（4）attention_bias：由 AQR + attention_bias_generator 得出的 attention_bias，作为注意力的加性偏置。
+多层 Decoder
+（1）每一层做“自注意力 + 交叉注意力 + FFN”：
+自注意力：查询之间互相交流信息，避免重复预测。
+交叉注意力：每个查询从 BEV 和 Camera 特征中取信息，attention_bias 决定从哪里取。
+（2）attention_bias 以加性方式加入 score（QK^T / sqrt(d) + bias），改变 softmax 的关注区域（第三部分详解）。
+（3）多层堆叠后输出一系列 refined queries，包含丰富的多模态融合信息。
+6）多任务检测头（CmtHead 输出层）
+对每个任务（不同类别组）设置独立的小头，例如：
+任务1：car；任务2：truck + construction_vehicle；…
+每个任务头对最后一层的查询特征进行：
+分类（heatmap/logits）、3D 中心、尺寸、朝向、速度等回归。
+综合各任务输出，得到最终的 3D 检测框集合，并与 GT 匹配，计算 FocalLoss、L1Loss、GaussianFocalLoss 等损失。
+这样，整体流程图可以画成：
+数据预处理 → LiDAR/Camera 双分支特征 → 查询初始化 → AQR 权重生成 → attention_bias 生成 → CMT Transformer 多模态融合（带 bias）→ 多任务检测头 → 损失与预测。
+二、权重生成（AQR + attention_bias_generator：给“权重生成图”用）
+这部分是我们相对传统 CMT/PETR 的核心创新之一：
+不直接用“硬编码的固定 bias”，而是为每个查询动态生成空间 + 模态相关的注意力偏置。
+可以分成两个层级模块：
+2.1 AQRWeightGenerator：为每个查询生成 LiDAR/Camera 全局权重
+1）输入
+（1）当前 Decoder 层的查询特征 q（每个 query 的 embedding）。
+（2）BEV/Camera 的局部特征片段（或者汇总信息，用于“看一眼当前附近的感知结果”）。
+（3）查询的 3D 参考点（已投影到 BEV 和图像坐标，用于知道 query 在各特征图上的位置）。
+2）内部机理（概念层面）
+（1）AQR 使用一个轻量级 Transformer Decoder 层（或类似结构），对每个查询及其局部上下文进行编码。
+（2）输出两个标量：
+lidar_weight[q]：该查询对 LiDAR 信息的“信任度”。
+camera_weight[q]：该查询对 Camera 信息的“信任度”。
+（3）通过 sigmoid 或 softmax 等方式压缩到一定范围，例如 [0, 1]。
+（4）结果是两个向量：
+lidar_weights: [batch_size, num_queries]
+camera_weights: [batch_size, num_queries]
+3）直观理解
+可以把 AQR 看成“为每个未来要预测的物体，先决策：我更依靠 LiDAR 还是 Camera？以及总体权重有多大？”
+这一层不管空间细节，只给出每个查询的模态级别权重。
+2.2 attention_bias_generator：把模态权重 + 空间位置变成真正的 attention_bias
+这里是权重生成的第二层，也是空间结构真正体现的地方。
+1）输入
+（1）来自 AQR 的 lidar_weights、camera_weights，形状 [B, Q]。
+（2）pts_bev_indices：每个查询在 BEV 特征图上的 1D 索引（通过 3D → BEV 网格投影得到）。
+（3）pts_pers_indices：每个查询在 6 个相机视角特征图上的 (view, h, w) 位置索引（通过 3D → 各相机图像的投影得到）。
+2）BEV bias 生成 _generate_bev_bias
+（1）思路：每个查询在 BEV 上有一个“中心位置”，我们只对它周围一个局部窗口做偏置，而不是整个 180×180。
+（2）步骤：
+计算该查询的局部窗口坐标（例如 5×5 或 7×7），得到一组 offset 索引。
+生成对应的 1D 索引列表 query_indices，并做边界裁剪。
+将 lidar_weights 扩展到窗口大小，如果启用高斯窗口，则乘以高斯系数（离中心越远权重越弱）。
+使用 scatter_add 把这些窗口内的权重加到一个全尺寸 BEV bias 图上，大小为 [B, Q, H_bev×W_bev]。
+（3）直观效果：
+对于每个 query，在 BEV 特征图上只增强.它附近一个小区域，且增强强度由该查询的 lidar_weight 决定。
+3）Camera bias 生成 _generate_camera_bias
+（1）类似思路，只不过是在透视特征图上（6×H_pers×W_pers）。
+（2）每个查询有一个或多个视角的投影位置，通过 (view, h, w) 找到特征图上的格子。
+（3）对当前位置及其局部邻域做类似窗口操作，用 camera_weights 控制增强强度。
+（4）最终得到形状 [B, Q, num_views×H_pers×W_pers] 的 Camera bias。
+4）拼接与缩放（这一步是 bias_scale 的位置）
+（1）拼接：
+attention_bias = concat(bev_bias, camera_bias, dim=-1)
+形状：[B, Q, H_bev×W_bev + num_views×H_pers×W_pers]。
+（2）缩放：
+定义一个全局的 bias_scale：
+如果是可学习参数，先通过 clamp(min_scale, max_scale) 限制范围。
+然后做关键一步：
+attention_bias = attention_bias * bias_scale
+这样可以整体控制 bias 的强度，防止过强或过弱。
+5）输出给 Transformer
+最终得到的 attention_bias 就是 [batch_size, num_queries, total_features] 的矩阵，将被 reshape/转置成 PyTorch SDPA 需要的 attn_mask 形状，并传给注意力层。
+所以“权重生成图”可以划分为：
+AQRWeightGenerator：
+查询特征 + 模态特征 → 每个查询的 LiDAR/Camera 权重
+→ attention_bias_generator：
+权重 + 查询在 BEV/Camera 上的位置
+→ BEV 局部 bias、Camera 局部 bias（窗口 + 高斯）
+→ 拼接 + bias_scale → attention_bias
+三、权重的实施（在注意力与特征上的具体作用：给“权重实施图”用）
+这一部分回答“这些权重最后到底作用到哪、怎么改变注意力/特征”的问题，是第二大创新点：
+我们把 AQR 生成的权重以“加性 attention bias”的方式注入 Transformer，而不是修改网络结构本身。
+可以分两层理解：
+3.1 在注意力公式中的位置（核心实现路径）
+1）标准注意力公式
+对于某一层 Decoder 的交叉注意力：
+score = (Q × K^T) / sqrt(d)
+attention = softmax(score)
+output = attention × V
+2）加入 attention_bias 后的公式
+我们做的是：
+score = (Q × K^T) / sqrt(d) + bias
+attention = softmax(score)
+output = attention × V
+其中：
+bias 就是前面生成的 attention_bias（按照 PyTorch 的要求 reshape 成 [B, heads, Q, K] 或 [B, Q, K] 的 attn_mask），数值范围大致是 [-bias_scale, +bias_scale]。
+3）直观效果
+如果某个位置的 bias 为正数：
+对应的 score 增大，softmax 后该位置得到更高的权重，查询会更“看重”那里的特征。
+如果某个位置的 bias 为负数：
+对应的 score 减小，该位置在 softmax 里几乎被抑制，查询会“忽略”那里的特征。
+如果 LiDAR 权重大而 Camera 权重小：
+在 BEV 的局部窗口里生成一簇正 bias，而在 Camera 特征上 bias 较小甚至偏负，
+结果是该 query 会主要从 LiDAR BEV 上取信息；反过来亦然。
+4）多层叠加的效果
+这种偏置会在每一层 Decoder 被重复使用（或重新生成），
+让查询在多层迭代中逐步形成稳定的“依赖偏好”：
+例如：某些车类目标更信 LiDAR，行人可能更信 Camera，
+而且不同查询、不同空间位置的偏好都可以是不同的。
+3.2 与特征调制（WeightRenderer/FeatureModulator）的关系
+项目规则里还有一条设计思路（可以作为进一步扩展，也可以在示意图中标出为“可选路径”）：
+1）权重图渲染（WeightRenderer）
+将 per-query 权重渲染成全局的 BEV 权重图和 Camera 权重图：
+输入：每个查询的 LiDAR/Camera 权重 + 查询位置。
+输出：
+BEV weight map：[B, H_bev, W_bev]
+Camera weight map：[B, num_views, H_pers, W_pers]
+渲染方式：高斯核散布、双线性插值等（与 attention_bias_generator 的局部窗口类似，只是从“偏置”变成“权重图”）。
+2）特征调制（FeatureModulator）
+把渲染出的权重图直接乘到特征图上：
+对 BEV：
+x_bev_mod = x_bev * bev_weight_map（按空间位置逐点乘）。
+对 Camera：
+x_img_mod = x_img * pers_weight_map（对每个视角的 2D 特征逐点乘）。
+这样做的效果是“先在特征层面做一次加权”，再把结果送入 Transformer。
+3）注意力偏置 vs 特征调制
+注意力偏置路径（当前主力实现）：
+特征本身不变，只通过 bias 改变 softmax 权重。优点是稳定、可解释，容易和 PyTorch SDPA 兼容。
+特征调制路径（可选扩展）：
+先对特征做空间加权，再进入注意力层，相当于对输入做“局部 gating”。
+两者可以同时存在：
+权重既影响“看哪里”（bias），又影响“那里信息本身的强度”（modulation）。
+在给其他人画“权重实施图”时，可以这样画：
+查询 + BEV/Camera 特征 →
+（支路1：AQR → attention_bias_generator → attention_bias → 加到 QK^T 上）
+（支路2：AQR → WeightRenderer → weight_maps → FeatureModulator → 调制后的 BEV/Camera 特征）
+→ Transformer 交叉注意力 → 融合后的查询 → 检测头
+并标清楚：
+支路1 是当前主线实现；支路2 是特征层调制的扩展设计。
